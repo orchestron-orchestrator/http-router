@@ -1,0 +1,440 @@
+import http
+import logging
+import time
+import uri
+
+
+def _extract_path(path: str) -> str:
+    parsed_path, remainder = uri.parse_path(path)
+    if isinstance(parsed_path, str) and parsed_path != "":
+        return parsed_path
+    return "/"
+
+
+def _normalize_path(path: str) -> str:
+    p = _extract_path(path)
+    if "\\" in p:
+        raise ValueError("Backslash not allowed in URI path")
+
+    parts: list[str] = []
+    for part in p.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise ValueError("Parent traversal is not allowed in URI path")
+        parts.append(part)
+
+    if len(parts) == 0:
+        return "/"
+    return "/" + "/".join(parts)
+
+
+def _split_segments(path: str) -> list[str]:
+    if path == "/":
+        return []
+    return path[1:].split("/")
+
+
+def _join_paths(left: str, right: str) -> str:
+    left_norm = _normalize_path(left)
+    right_norm = _normalize_path(right)
+    if left_norm == "/":
+        return right_norm
+    if right_norm == "/":
+        return left_norm
+    return left_norm + right_norm
+
+
+def _parse_query_params(path: str) -> dict[str, str]:
+    query_params: dict[str, str] = {}
+    path_component, remainder = uri.parse_path(path)
+    query_string, fragment_remainder = uri.parse_query(remainder)
+    query_text: str = query_string if isinstance(query_string, str) else ""
+    if query_text == "":
+        return query_params
+
+    for param in query_text.split("&"):
+        if param == "":
+            continue
+        if "=" in param:
+            kv = param.split("=", 1)
+            query_params[kv[0]] = kv[1]
+        else:
+            query_params[param] = ""
+    return query_params
+
+
+def _is_param_segment(segment: str) -> bool:
+    return segment.startswith(r"{") and segment.endswith(r"}") and len(segment) > 2
+
+
+def _param_name(segment: str) -> str:
+    return segment[1:-1]
+
+
+def _is_wildcard_segment(segment: str) -> bool:
+    return segment.startswith("*") and len(segment) > 1
+
+
+def _wildcard_name(segment: str) -> str:
+    return segment[1:]
+
+
+def _compile_pattern(pattern: str) -> (str, list[str], int):
+    normalized = _normalize_path(pattern)
+    segments = _split_segments(normalized)
+    score = 0
+
+    idx = 0
+    while idx < len(segments):
+        segment = segments[idx]
+
+        # Higher scores represent more specific patterns so route selection can
+        # stay simple: static > param > wildcard.
+        if _is_param_segment(segment):
+            score += 10
+            idx += 1
+            continue
+
+        if _is_wildcard_segment(segment):
+            if idx != len(segments) - 1:
+                raise ValueError("Wildcard segment must be the last pattern segment")
+            idx += 1
+            continue
+
+        score += 100
+        idx += 1
+
+    return normalized, segments, score + len(segments)
+
+
+def _patterns_conflict(left_segments: list[str], right_segments: list[str]) -> bool:
+    if len(left_segments) != len(right_segments):
+        return False
+
+    idx = 0
+    while idx < len(left_segments):
+        left = left_segments[idx]
+        right = right_segments[idx]
+
+        if _is_param_segment(left) and _is_param_segment(right):
+            idx += 1
+            continue
+
+        if _is_wildcard_segment(left) and _is_wildcard_segment(right):
+            idx += 1
+            continue
+
+        if left != right:
+            return False
+
+        idx += 1
+
+    return True
+
+
+def _match_pattern(segments: list[str], path_segments: list[str]) -> ?dict[str, str]:
+    params: dict[str, str] = {}
+    seg_idx = 0
+    path_idx = 0
+
+    while seg_idx < len(segments):
+        segment = segments[seg_idx]
+
+        if _is_wildcard_segment(segment):
+            params[_wildcard_name(segment)] = "/".join(path_segments[path_idx:])
+            return params
+
+        if path_idx >= len(path_segments):
+            return None
+
+        actual = path_segments[path_idx]
+        if _is_param_segment(segment):
+            params[_param_name(segment)] = actual
+            seg_idx += 1
+            path_idx += 1
+            continue
+
+        if segment != actual:
+            return None
+
+        seg_idx += 1
+        path_idx += 1
+
+    if path_idx != len(path_segments):
+        return None
+    return params
+
+
+def _default_not_found_handler(ctx: Context, respond: proc(int, dict[str, str], str) -> None):
+    respond(404, {}, "")
+
+
+def _apply_middleware(
+    terminal_handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None,
+    middlewares: list[proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None]
+) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None:
+    idx = len(middlewares) - 1
+    downstream_handler = terminal_handler
+    while idx >= 0:
+        middleware = middlewares[idx]
+        downstream_handler = middleware(downstream_handler)
+        idx -= 1
+    return downstream_handler
+
+
+class Context(object):
+    """Per-request context passed through middleware and handlers."""
+    def __init__(self, request: http.Request, path: str, raw_path: str, params: dict[str, str]):
+        self.request = request
+        self.path = path
+        self.raw_path = raw_path
+        self.params = params
+        self._query_params = None
+        self._values = {}
+
+    def param(self, key: str, default: str = "") -> str:
+        return self.params.get_def(key, default)
+
+    def query_param(self, key: str, default: str = "") -> str:
+        return self.query().get_def(key, default)
+
+    def query(self) -> dict[str, str]:
+        cached = self._query_params
+        if cached is not None:
+            return cached
+        parsed = _parse_query_params(self.raw_path)
+        self._query_params = parsed
+        return parsed
+
+    def set(self, key: str, value: ?value):
+        self._values[key] = value
+
+    def get(self, key: str) -> ?value:
+        return self._values.get(key)
+
+
+class _Route(object):
+    method: str
+    segments: list[str]
+    score: int
+    middlewares: list[proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None]
+    @property
+    handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None
+
+    def __init__(
+        self,
+        method: str,
+        segments: list[str],
+        score: int,
+        middlewares: list[proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None],
+        handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None
+    ):
+        self.method = method
+        self.segments = segments
+        self.score = score
+        self.middlewares = middlewares
+        self.handler = handler
+
+
+class RouteRegistrar(object):
+    """Shared registration surface for HTTP verb helpers."""
+    handle : proc(str, str, proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> None
+
+    def get(self, pattern: str, handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        self.handle("GET", pattern, handler)
+
+    def post(self, pattern: str, handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        self.handle("POST", pattern, handler)
+
+    def put(self, pattern: str, handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        self.handle("PUT", pattern, handler)
+
+    def patch(self, pattern: str, handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        self.handle("PATCH", pattern, handler)
+
+    def delete(self, pattern: str, handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        self.handle("DELETE", pattern, handler)
+
+    def options(self, pattern: str, handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        self.handle("OPTIONS", pattern, handler)
+
+
+class RouteGroup(RouteRegistrar):
+    """Scoped registration interface used inside Router.route(...)."""
+    use : proc(proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> None
+    route : proc(str, proc(RouteGroup) -> None) -> None
+
+
+class _ScopedGroup(RouteGroup):
+    """Prefix and middleware adapter for route(...) builders.
+
+    Router owns the actual route table. Nested builders still need the same
+    RouteGroup interface, but with registrations rewritten relative to a fixed
+    prefix.
+    """
+    router: Router
+    prefix: str
+    middlewares: list[proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None]
+
+    def __init__(
+        self,
+        router: Router,
+        prefix: str,
+        middlewares: list[proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None]
+    ):
+        self.router = router
+        self.prefix = prefix
+        self.middlewares = middlewares
+
+    def use(self, middleware: proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        self.middlewares.append(middleware)
+
+    def handle(self, method: str, pattern: str, handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        # Freeze the current scoped middleware stack for this route so later
+        # g.use(...) calls do not retroactively change already-registered routes.
+        self.router._add_route(method, _join_paths(self.prefix, pattern), handler, self.middlewares + [])
+
+    def route(self, prefix: str, build: proc(RouteGroup) -> None):
+        # Child groups inherit the middleware stack as it exists now, but then
+        # evolve independently from their parent and sibling groups.
+        build(_ScopedGroup(self.router, _join_paths(self.prefix, prefix), self.middlewares + []))
+
+
+class Router(RouteRegistrar):
+    """Small score-based HTTP router with global middleware and scoped route groups."""
+    routes: list[_Route]
+    middlewares: list[proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None]
+    @property
+    not_found_handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None
+
+    def __init__(self):
+        self.routes = []
+        self.middlewares = []
+        self.not_found_handler = _default_not_found_handler
+
+    def use(self, middleware: proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        self.middlewares.append(middleware)
+
+    def _add_route(
+        self,
+        method: str,
+        pattern: str,
+        handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None,
+        route_middlewares: list[proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None]
+    ):
+        method_norm = method.upper().strip()
+        pattern_norm, segments, score = _compile_pattern(pattern)
+
+        for route in self.routes:
+            if route.method == method_norm and _patterns_conflict(route.segments, segments):
+                raise ValueError("route overlap for " + method_norm + " " + pattern_norm)
+
+        self.routes.append(_Route(method_norm, segments, score, route_middlewares, handler))
+
+    def handle(self, method: str, pattern: str, handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        self._add_route(method, pattern, handler, [])
+
+    def route(self, prefix: str, build: proc(RouteGroup) -> None):
+        build(_ScopedGroup(self, _normalize_path(prefix), []))
+
+    def not_found(self, handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        self.not_found_handler = handler
+
+    def _select_route(
+        self,
+        method: str,
+        path_segments: list[str]
+    ) -> ?(
+        route: _Route,
+        params: dict[str, str]
+    ):
+        best_route = None
+        best_params = None
+        best_score = -1
+        best_idx = len(self.routes)
+
+        idx = 0
+        for route in self.routes:
+            if route.method != method:
+                idx += 1
+                continue
+
+            params = _match_pattern(route.segments, path_segments)
+            if params is not None:
+                # Prefer the highest specificity score; keep first-registration
+                # order as the tie-breaker for equally specific patterns.
+                if route.score > best_score or (route.score == best_score and idx < best_idx):
+                    best_route = route
+                    best_params = params
+                    best_score = route.score
+                    best_idx = idx
+
+            idx += 1
+
+        if best_route is not None and best_params is not None:
+            return (
+                route=best_route,
+                params=best_params
+            )
+        return None
+
+    def _dispatch(self, handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None, ctx: Context, respond: proc(int, dict[str, str], str) -> None):
+        try:
+            handler(ctx, respond)
+        except Exception:
+            respond(500, {}, "")
+
+    def serve(self, request: http.Request, respond: proc(int, dict[str, str], str) -> None):
+        request_path = request.path
+        req_method = request.method
+        method = req_method.upper().strip() if isinstance(req_method, str) else ""
+
+        normalized_path = ""
+        try:
+            normalized_path = _normalize_path(request_path)
+        except ValueError:
+            respond(400, {}, "")
+            return
+
+        path_segments = _split_segments(normalized_path)
+        matched = self._select_route(method, path_segments)
+
+        if matched is not None:
+            ctx = Context(request, normalized_path, request_path, matched.params)
+            wrapped = _apply_middleware(matched.route.handler, self.middlewares + matched.route.middlewares)
+            self._dispatch(wrapped, ctx, respond)
+            return
+
+        ctx = Context(request, normalized_path, request_path, {})
+        wrapped_fallback = _apply_middleware(self.not_found_handler, self.middlewares)
+        self._dispatch(wrapped_fallback, ctx, respond)
+
+
+def recoverer_middleware(log: ?logging.Logger = None) -> proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None:
+    """Catch unexpected exceptions and return 500 unless already responded."""
+    def middleware(next_handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        def wrapped(ctx: Context, respond: proc(int, dict[str, str], str) -> None):
+            try:
+                next_handler(ctx, respond)
+            except Exception:
+                respond(500, {}, "")
+        return wrapped
+    return middleware
+
+
+def access_log_middleware(log: logging.Logger) -> proc(proc(Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(Context, proc(int, dict[str, str], str) -> None) -> None:
+    """Log request method/path plus response status/latency when written."""
+    def middleware(next_handler: proc(Context, proc(int, dict[str, str], str) -> None) -> None):
+        def wrapped(ctx: Context, respond: proc(int, dict[str, str], str) -> None):
+            req_method = ctx.request.method
+            method = req_method if isinstance(req_method, str) else "UNKNOWN"
+            stopwatch = time.Stopwatch()
+
+            def wrapped_respond(status: int, headers: dict[str, str], body: str):
+                log.info("HTTP response", {"method": method, "path": ctx.path, "status": status, "latency_ms": stopwatch.elapsed().to_float() * 1000.0})
+                respond(status, headers, body)
+
+            next_handler(ctx, wrapped_respond)
+        return wrapped
+    return middleware

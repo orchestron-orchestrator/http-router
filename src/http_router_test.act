@@ -1,0 +1,392 @@
+import http
+import http_router
+import logging
+import testing
+
+
+class _ResponseCapture(object):
+    def __init__(self, on_done: ?proc(_ResponseCapture) -> None = None):
+        self.status = 0
+        self.headers = {}
+        self.body = ""
+        self.on_done = on_done
+
+    def respond(self, status: int, headers: dict[str, str], body: str):
+        self.status = status
+        self.headers = headers
+        self.body = body
+        on_done = self.on_done
+        if on_done is not None:
+            on_done(self)
+
+
+def _request(method: str, path: str, headers: dict[str, str] = {}, body: bytes = b"") -> http.Request:
+    return http.Request(method, path, b"1.1", headers, body)
+
+
+def _ok_handler(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+    respond(200, {"Content-Type": "text/plain"}, "ok")
+
+
+def _suffix_middleware(suffix: str) -> proc(proc(http_router.Context, proc(int, dict[str, str], str) -> None) -> None) -> proc(http_router.Context, proc(int, dict[str, str], str) -> None) -> None:
+    def middleware(downstream_handler: proc(http_router.Context, proc(int, dict[str, str], str) -> None) -> None):
+        def wrapped(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+            def wrapped_respond(status: int, headers: dict[str, str], body: str):
+                respond(status, headers, "{body}{suffix}")
+
+            downstream_handler(ctx, wrapped_respond)
+        return wrapped
+    return middleware
+
+
+actor _test_route_precedence_and_params(t: testing.EnvT):
+    r = http_router.Router()
+
+    def static_handler(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        respond(200, {"Content-Type": "text/plain"}, "static")
+
+    def param_handler(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        respond(200, {"Content-Type": "text/plain"}, "param:{ctx.param("id")}")
+
+    def wildcard_handler(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        respond(200, {"Content-Type": "text/plain"}, "wild:{ctx.param("tail")}")
+
+    r.get("/items/{{id}}", param_handler)
+    r.get("/items/special", static_handler)
+    r.get("/items/*tail", wildcard_handler)
+
+    try:
+        static_res = _ResponseCapture()
+        r.serve(_request("GET", "/items/special"), static_res.respond)
+        testing.assertEqual(static_res.status, 200, None)
+        testing.assertEqual(static_res.body, "static", None)
+
+        param_res = _ResponseCapture()
+        r.serve(_request("GET", "/items/123?x=1"), param_res.respond)
+        testing.assertEqual(param_res.status, 200, None)
+        testing.assertEqual(param_res.body, "param:123", None)
+
+        wildcard_res = _ResponseCapture()
+        r.serve(_request("GET", "/items/a/b/c"), wildcard_res.respond)
+        testing.assertEqual(wildcard_res.status, 200, None)
+        testing.assertEqual(wildcard_res.body, "wild:a/b/c", None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_backtracks_when_static_path_has_wrong_method(t: testing.EnvT):
+    r = http_router.Router()
+
+    def post_static_handler(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        respond(201, {"Content-Type": "text/plain"}, "created")
+
+    def param_get_handler(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        respond(200, {"Content-Type": "text/plain"}, "param:{ctx.param("id")}")
+
+    def wildcard_get_handler(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        respond(200, {"Content-Type": "text/plain"}, "wild:{ctx.param("tail")}")
+
+    r.post("/items/special", post_static_handler)
+    r.get("/items/{{id}}", param_get_handler)
+    r.get("/files/*tail", wildcard_get_handler)
+    r.post("/files/readme", post_static_handler)
+
+    try:
+        param_res = _ResponseCapture()
+        r.serve(_request("GET", "/items/special"), param_res.respond)
+        testing.assertEqual(param_res.status, 200, None)
+        testing.assertEqual(param_res.body, "param:special", None)
+
+        wildcard_res = _ResponseCapture()
+        r.serve(_request("GET", "/files/readme"), wildcard_res.respond)
+        testing.assertEqual(wildcard_res.status, 200, None)
+        testing.assertEqual(wildcard_res.body, "wild:readme", None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_query_param_helper(t: testing.EnvT):
+    r = http_router.Router()
+
+    def query_handler(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        respond(200, {"Content-Type": "text/plain"}, "{ctx.query_param("q", "<missing>")}|{ctx.query_param("empty", "<missing>")}|{ctx.query_param("missing", "<missing>")}")
+
+    r.get("/search", query_handler)
+
+    try:
+        res = _ResponseCapture()
+        r.serve(_request("GET", "/search?q=abc&empty"), res.respond)
+        testing.assertEqual(res.status, 200, None)
+        testing.assertEqual(res.body, "abc||<missing>", None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_context_values_can_be_set_in_middleware(t: testing.EnvT):
+    r = http_router.Router()
+
+    def inject_values(next_handler: proc(http_router.Context, proc(int, dict[str, str], str) -> None) -> None):
+        def wrapped(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+            route_id = ctx.param("id")
+            ctx.set("device_name", "edge-1")
+            ctx.set("device_index", 7)
+            ctx.set("route_id_seen_by_middleware", route_id)
+            next_handler(ctx, respond)
+        return wrapped
+
+    def handler(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        device_name = ctx.get("device_name")
+        device_index = ctx.get("device_index")
+        route_id_seen_by_middleware = ctx.get("route_id_seen_by_middleware")
+        route_id = ctx.param("id")
+        missing = ctx.get("missing")
+        if isinstance(device_name, str) and isinstance(device_index, int) and isinstance(route_id_seen_by_middleware, str) and route_id != "" and missing is None:
+            respond(200, {"Content-Type": "text/plain"}, "{device_name}:{device_index}:{route_id_seen_by_middleware}:{route_id}")
+            return
+        respond(500, {"Content-Type": "text/plain"}, "missing")
+
+    def install(g: http_router.RouteGroup):
+        g.use(inject_values)
+        g.get("/ctx/{{id}}", handler)
+
+    r.route("/api", install)
+
+    def done(r):
+        try:
+            testing.assertEqual(r.status, 200, None)
+            testing.assertEqual(r.body, "edge-1:7:42:42", None)
+            after 0.1: t.success()
+        except Exception as e:
+            t.failure(e)
+
+    try:
+        res = _ResponseCapture(done)
+        r.serve(_request("GET", "/api/ctx/42"), res.respond)
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_not_found_on_method_mismatch(t: testing.EnvT):
+    r = http_router.Router()
+    r.get("/api/ping", _ok_handler)
+    r.post("/api/ping", _ok_handler)
+
+    try:
+        wrong_method_res = _ResponseCapture()
+        r.serve(_request("PATCH", "/api/ping"), wrong_method_res.respond)
+        testing.assertEqual(wrong_method_res.status, 404, None)
+        testing.assertEqual(wrong_method_res.body, "", None)
+
+        not_found_res = _ResponseCapture()
+        r.serve(_request("GET", "/does-not-exist"), not_found_res.respond)
+        testing.assertEqual(not_found_res.status, 404, None)
+        testing.assertEqual(not_found_res.body, "", None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_route_groups_join_prefixes(t: testing.EnvT):
+    r = http_router.Router()
+
+    def build_v1(g: http_router.RouteGroup):
+        g.get("/info", _ok_handler)
+
+    def build_api(g: http_router.RouteGroup):
+        g.route("/v1", build_v1)
+
+    r.route("/api", build_api)
+
+    try:
+        res = _ResponseCapture()
+        r.serve(_request("GET", "/api/v1/info"), res.respond)
+        testing.assertEqual(res.status, 200, None)
+        testing.assertEqual(res.body, "ok", None)
+
+        miss = _ResponseCapture()
+        r.serve(_request("GET", "/info"), miss.respond)
+        testing.assertEqual(miss.status, 404, None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_route_bundle_installs_on_root_and_nested_prefixes(t: testing.EnvT):
+    r = http_router.Router()
+
+    def install(bundle: http_router.RouteGroup):
+        bundle.get("/ping", _ok_handler)
+
+    r.route("/", install)
+    r.route("/api", install)
+
+    try:
+        root_res = _ResponseCapture()
+        r.serve(_request("GET", "/ping"), root_res.respond)
+        testing.assertEqual(root_res.status, 200, None)
+        testing.assertEqual(root_res.body, "ok", None)
+
+        nested_res = _ResponseCapture()
+        r.serve(_request("GET", "/api/ping"), nested_res.respond)
+        testing.assertEqual(nested_res.status, 200, None)
+        testing.assertEqual(nested_res.body, "ok", None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_multiple_bundles_can_share_root_prefix(t: testing.EnvT):
+    r = http_router.Router()
+
+    def install_health(g: http_router.RouteGroup):
+        g.get("/health", _ok_handler)
+
+    def install_metrics(g: http_router.RouteGroup):
+        g.get("/metrics", _ok_handler)
+
+    r.route("/", install_health)
+    r.route("/", install_metrics)
+
+    try:
+        health_res = _ResponseCapture()
+        r.serve(_request("GET", "/health"), health_res.respond)
+        testing.assertEqual(health_res.status, 200, None)
+        testing.assertEqual(health_res.body, "ok", None)
+
+        metrics_res = _ResponseCapture()
+        r.serve(_request("GET", "/metrics"), metrics_res.respond)
+        testing.assertEqual(metrics_res.status, 200, None)
+        testing.assertEqual(metrics_res.body, "ok", None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_scoped_middleware_applies_only_within_installed_bundle(t: testing.EnvT):
+    r = http_router.Router()
+    r.use(_suffix_middleware(":global"))
+    r.get("/root", _ok_handler)
+
+    def install_api(g: http_router.RouteGroup):
+        g.use(_suffix_middleware(":api"))
+        g.get("/ping", _ok_handler)
+
+    r.route("/api", install_api)
+
+    try:
+        root_res = _ResponseCapture()
+        r.serve(_request("GET", "/root"), root_res.respond)
+        testing.assertEqual(root_res.status, 200, None)
+        testing.assertEqual(root_res.body, "ok:global", None)
+
+        api_res = _ResponseCapture()
+        r.serve(_request("GET", "/api/ping"), api_res.respond)
+        testing.assertEqual(api_res.status, 200, None)
+        testing.assertEqual(api_res.body, "ok:api:global", None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_route_overlap_is_rejected(t: testing.EnvT):
+    r = http_router.Router()
+
+    try:
+        r.get("/items/{{id}}", _ok_handler)
+
+        raised = 0
+        try:
+            r.get("/items/{{slug}}", _ok_handler)
+        except ValueError:
+            raised = 1
+
+        testing.assertEqual(raised, 1, None)
+
+        res = _ResponseCapture()
+        r.serve(_request("GET", "/items/abc"), res.respond)
+        testing.assertEqual(res.status, 200, None)
+        testing.assertEqual(res.body, "ok", None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_custom_not_found_handler(t: testing.EnvT):
+    r = http_router.Router()
+
+    def custom_not_found(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        respond(404, {"Content-Type": "text/plain"}, "missing:{ctx.path}")
+
+    r.not_found(custom_not_found)
+
+    try:
+        res = _ResponseCapture()
+        r.serve(_request("GET", "/missing"), res.respond)
+        testing.assertEqual(res.status, 404, None)
+        testing.assertEqual(res.body, "missing:/missing", None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_access_log_middleware(t: testing.EnvT):
+    var r = http_router.Router()
+    log = logging.Logger(t.log_handler)
+    r.use(http_router.access_log_middleware(log))
+
+    def logged_handler(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        after 0.1: respond(201, {"Content-Type": "text/plain"}, "logged")
+
+    r.get("/access-log", logged_handler)
+
+    def done(r):
+        try:
+            testing.assertEqual(r.status, 201, None)
+            testing.assertEqual(r.body, "logged", None)
+            after 0.1: t.success()
+        except Exception as e:
+            t.failure(e)
+
+    try:
+        res = _ResponseCapture(done)
+        r.serve(_request("GET", "/access-log"), res.respond)
+    except Exception as e:
+        t.failure(e)
+
+
+actor _test_recoverer_middleware(t: testing.EnvT):
+    r = http_router.Router()
+    r.use(http_router.recoverer_middleware())
+
+    def boom_handler(ctx, respond):
+        raise ValueError("boom")
+
+    r.get("/boom", boom_handler)
+
+    try:
+        boom_res = _ResponseCapture()
+        r.serve(_request("GET", "/boom"), boom_res.respond)
+        testing.assertEqual(boom_res.status, 500, None)
+        testing.assertEqual(boom_res.body, "", None)
+
+        bad_path_res = _ResponseCapture()
+        r.serve(_request("GET", "/bad\\path"), bad_path_res.respond)
+        testing.assertEqual(bad_path_res.status, 400, None)
+        testing.assertEqual(bad_path_res.body, "", None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)
