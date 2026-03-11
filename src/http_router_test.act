@@ -39,6 +39,25 @@ def _suffix_middleware(suffix: str) -> proc(proc(http_router.Context, proc(int, 
     return middleware
 
 
+def _serve_and_assert(t: testing.EnvT, r, request, expected_status, expected_body, next=None):
+    def done(res: _ResponseCapture):
+        try:
+            testing.assertEqual(res.status, expected_status)
+            testing.assertEqual(res.body, expected_body)
+            if next is not None:
+                next()
+            else:
+                t.success()
+        except Exception as e:
+            t.failure(e)
+
+    try:
+        res = _ResponseCapture(done)
+        r.serve(request, res.respond)
+    except Exception as e:
+        t.failure(e)
+
+
 actor _test_route_precedence_and_params(t: testing.EnvT):
     r = http_router.Router()
 
@@ -55,23 +74,14 @@ actor _test_route_precedence_and_params(t: testing.EnvT):
     r.get("/items/special", static_handler)
     r.get("/items/*tail", wildcard_handler)
 
+    def after_static():
+        _serve_and_assert(t, r, _request("GET", "/items/123?x=1"), 200, "param:123", after_param)
+
+    def after_param():
+        _serve_and_assert(t, r, _request("GET", "/items/a/b/c"), 200, "wild:a/b/c")
+
     try:
-        static_res = _ResponseCapture()
-        r.serve(_request("GET", "/items/special"), static_res.respond)
-        testing.assertEqual(static_res.status, 200, None)
-        testing.assertEqual(static_res.body, "static", None)
-
-        param_res = _ResponseCapture()
-        r.serve(_request("GET", "/items/123?x=1"), param_res.respond)
-        testing.assertEqual(param_res.status, 200, None)
-        testing.assertEqual(param_res.body, "param:123", None)
-
-        wildcard_res = _ResponseCapture()
-        r.serve(_request("GET", "/items/a/b/c"), wildcard_res.respond)
-        testing.assertEqual(wildcard_res.status, 200, None)
-        testing.assertEqual(wildcard_res.body, "wild:a/b/c", None)
-
-        t.success()
+        _serve_and_assert(t, r, _request("GET", "/items/special"), 200, "static", after_static)
     except Exception as e:
         t.failure(e)
 
@@ -93,18 +103,11 @@ actor _test_backtracks_when_static_path_has_wrong_method(t: testing.EnvT):
     r.get("/files/*tail", wildcard_get_handler)
     r.post("/files/readme", post_static_handler)
 
+    def after_param():
+        _serve_and_assert(t, r, _request("GET", "/files/readme"), 200, "wild:readme")
+
     try:
-        param_res = _ResponseCapture()
-        r.serve(_request("GET", "/items/special"), param_res.respond)
-        testing.assertEqual(param_res.status, 200, None)
-        testing.assertEqual(param_res.body, "param:special", None)
-
-        wildcard_res = _ResponseCapture()
-        r.serve(_request("GET", "/files/readme"), wildcard_res.respond)
-        testing.assertEqual(wildcard_res.status, 200, None)
-        testing.assertEqual(wildcard_res.body, "wild:readme", None)
-
-        t.success()
+        _serve_and_assert(t, r, _request("GET", "/items/special"), 200, "param:special", after_param)
     except Exception as e:
         t.failure(e)
 
@@ -118,12 +121,7 @@ actor _test_query_param_helper(t: testing.EnvT):
     r.get("/search", query_handler)
 
     try:
-        res = _ResponseCapture()
-        r.serve(_request("GET", "/search?q=abc&empty"), res.respond)
-        testing.assertEqual(res.status, 200, None)
-        testing.assertEqual(res.body, "abc||<missing>", None)
-
-        t.success()
+        _serve_and_assert(t, r, _request("GET", "/search?q=abc&empty"), 200, "abc||<missing>")
     except Exception as e:
         t.failure(e)
 
@@ -157,17 +155,8 @@ actor _test_context_values_can_be_set_in_middleware(t: testing.EnvT):
 
     r.route("/api", install)
 
-    def done(r):
-        try:
-            testing.assertEqual(r.status, 200, None)
-            testing.assertEqual(r.body, "edge-1:7:42:42", None)
-            after 0.1: t.success()
-        except Exception as e:
-            t.failure(e)
-
     try:
-        res = _ResponseCapture(done)
-        r.serve(_request("GET", "/api/ctx/42"), res.respond)
+        _serve_and_assert(t, r, _request("GET", "/api/ctx/42"), 200, "edge-1:7:42:42")
     except Exception as e:
         t.failure(e)
 
@@ -177,18 +166,11 @@ actor _test_not_found_on_method_mismatch(t: testing.EnvT):
     r.get("/api/ping", _ok_handler)
     r.post("/api/ping", _ok_handler)
 
+    def after_wrong_method():
+        _serve_and_assert(t, r, _request("GET", "/does-not-exist"), 404, "")
+
     try:
-        wrong_method_res = _ResponseCapture()
-        r.serve(_request("PATCH", "/api/ping"), wrong_method_res.respond)
-        testing.assertEqual(wrong_method_res.status, 404, None)
-        testing.assertEqual(wrong_method_res.body, "", None)
-
-        not_found_res = _ResponseCapture()
-        r.serve(_request("GET", "/does-not-exist"), not_found_res.respond)
-        testing.assertEqual(not_found_res.status, 404, None)
-        testing.assertEqual(not_found_res.body, "", None)
-
-        t.success()
+        _serve_and_assert(t, r, _request("PATCH", "/api/ping"), 404, "", after_wrong_method)
     except Exception as e:
         t.failure(e)
 
@@ -204,17 +186,11 @@ actor _test_route_groups_join_prefixes(t: testing.EnvT):
 
     r.route("/api", build_api)
 
+    def after_hit():
+        _serve_and_assert(t, r, _request("GET", "/info"), 404, "")
+
     try:
-        res = _ResponseCapture()
-        r.serve(_request("GET", "/api/v1/info"), res.respond)
-        testing.assertEqual(res.status, 200, None)
-        testing.assertEqual(res.body, "ok", None)
-
-        miss = _ResponseCapture()
-        r.serve(_request("GET", "/info"), miss.respond)
-        testing.assertEqual(miss.status, 404, None)
-
-        t.success()
+        _serve_and_assert(t, r, _request("GET", "/api/v1/info"), 200, "ok", after_hit)
     except Exception as e:
         t.failure(e)
 
@@ -228,18 +204,11 @@ actor _test_route_bundle_installs_on_root_and_nested_prefixes(t: testing.EnvT):
     r.route("/", install)
     r.route("/api", install)
 
+    def after_root():
+        _serve_and_assert(t, r, _request("GET", "/api/ping"), 200, "ok")
+
     try:
-        root_res = _ResponseCapture()
-        r.serve(_request("GET", "/ping"), root_res.respond)
-        testing.assertEqual(root_res.status, 200, None)
-        testing.assertEqual(root_res.body, "ok", None)
-
-        nested_res = _ResponseCapture()
-        r.serve(_request("GET", "/api/ping"), nested_res.respond)
-        testing.assertEqual(nested_res.status, 200, None)
-        testing.assertEqual(nested_res.body, "ok", None)
-
-        t.success()
+        _serve_and_assert(t, r, _request("GET", "/ping"), 200, "ok", after_root)
     except Exception as e:
         t.failure(e)
 
@@ -256,18 +225,11 @@ actor _test_multiple_bundles_can_share_root_prefix(t: testing.EnvT):
     r.route("/", install_health)
     r.route("/", install_metrics)
 
+    def after_health():
+        _serve_and_assert(t, r, _request("GET", "/metrics"), 200, "ok")
+
     try:
-        health_res = _ResponseCapture()
-        r.serve(_request("GET", "/health"), health_res.respond)
-        testing.assertEqual(health_res.status, 200, None)
-        testing.assertEqual(health_res.body, "ok", None)
-
-        metrics_res = _ResponseCapture()
-        r.serve(_request("GET", "/metrics"), metrics_res.respond)
-        testing.assertEqual(metrics_res.status, 200, None)
-        testing.assertEqual(metrics_res.body, "ok", None)
-
-        t.success()
+        _serve_and_assert(t, r, _request("GET", "/health"), 200, "ok", after_health)
     except Exception as e:
         t.failure(e)
 
@@ -283,18 +245,11 @@ actor _test_scoped_middleware_applies_only_within_installed_bundle(t: testing.En
 
     r.route("/api", install_api)
 
+    def after_root():
+        _serve_and_assert(t, r, _request("GET", "/api/ping"), 200, "ok:api:global")
+
     try:
-        root_res = _ResponseCapture()
-        r.serve(_request("GET", "/root"), root_res.respond)
-        testing.assertEqual(root_res.status, 200, None)
-        testing.assertEqual(root_res.body, "ok:global", None)
-
-        api_res = _ResponseCapture()
-        r.serve(_request("GET", "/api/ping"), api_res.respond)
-        testing.assertEqual(api_res.status, 200, None)
-        testing.assertEqual(api_res.body, "ok:api:global", None)
-
-        t.success()
+        _serve_and_assert(t, r, _request("GET", "/root"), 200, "ok:global", after_root)
     except Exception as e:
         t.failure(e)
 
@@ -311,14 +266,8 @@ actor _test_route_overlap_is_rejected(t: testing.EnvT):
         except ValueError:
             raised = 1
 
-        testing.assertEqual(raised, 1, None)
-
-        res = _ResponseCapture()
-        r.serve(_request("GET", "/items/abc"), res.respond)
-        testing.assertEqual(res.status, 200, None)
-        testing.assertEqual(res.body, "ok", None)
-
-        t.success()
+        testing.assertEqual(raised, 1)
+        _serve_and_assert(t, r, _request("GET", "/items/abc"), 200, "ok")
     except Exception as e:
         t.failure(e)
 
@@ -332,12 +281,7 @@ actor _test_custom_not_found_handler(t: testing.EnvT):
     r.not_found(custom_not_found)
 
     try:
-        res = _ResponseCapture()
-        r.serve(_request("GET", "/missing"), res.respond)
-        testing.assertEqual(res.status, 404, None)
-        testing.assertEqual(res.body, "missing:/missing", None)
-
-        t.success()
+        _serve_and_assert(t, r, _request("GET", "/missing"), 404, "missing:/missing")
     except Exception as e:
         t.failure(e)
 
@@ -352,17 +296,8 @@ actor _test_access_log_middleware(t: testing.EnvT):
 
     r.get("/access-log", logged_handler)
 
-    def done(r):
-        try:
-            testing.assertEqual(r.status, 201, None)
-            testing.assertEqual(r.body, "logged", None)
-            after 0.1: t.success()
-        except Exception as e:
-            t.failure(e)
-
     try:
-        res = _ResponseCapture(done)
-        r.serve(_request("GET", "/access-log"), res.respond)
+        _serve_and_assert(t, r, _request("GET", "/access-log"), 201, "logged")
     except Exception as e:
         t.failure(e)
 
@@ -376,17 +311,10 @@ actor _test_recoverer_middleware(t: testing.EnvT):
 
     r.get("/boom", boom_handler)
 
+    def after_boom():
+        _serve_and_assert(t, r, _request("GET", "/bad\\path"), 400, "")
+
     try:
-        boom_res = _ResponseCapture()
-        r.serve(_request("GET", "/boom"), boom_res.respond)
-        testing.assertEqual(boom_res.status, 500, None)
-        testing.assertEqual(boom_res.body, "", None)
-
-        bad_path_res = _ResponseCapture()
-        r.serve(_request("GET", "/bad\\path"), bad_path_res.respond)
-        testing.assertEqual(bad_path_res.status, 400, None)
-        testing.assertEqual(bad_path_res.body, "", None)
-
-        t.success()
+        _serve_and_assert(t, r, _request("GET", "/boom"), 500, "", after_boom)
     except Exception as e:
         t.failure(e)
