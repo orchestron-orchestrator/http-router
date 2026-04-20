@@ -417,8 +417,10 @@ def recoverer_middleware(log: ?logging.Logger = None) -> proc(proc(Context, proc
         def wrapped(ctx: Context, respond: proc(int, dict[str, str], str) -> None):
             try:
                 next_handler(ctx, respond)
-            except Exception:
-                respond(500, {}, "")
+            except Exception as e:
+                if log is not None:
+                    log.error("handler raised exception", {"method": ctx.request.method, "path": ctx.path, "error": str(e)})
+                respond(500, {}, "Internal server error")
         return wrapped
     return middleware
 

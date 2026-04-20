@@ -315,6 +315,6 @@ actor _test_recoverer_middleware(t: testing.EnvT):
         _serve_and_assert(t, r, _request("GET", "/bad\\path"), 400, "")
 
     try:
-        _serve_and_assert(t, r, _request("GET", "/boom"), 500, "", after_boom)
+        _serve_and_assert(t, r, _request("GET", "/boom"), 500, "Internal server error", after_boom)
     except Exception as e:
         t.failure(e)
